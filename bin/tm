@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# tm CLI: bin/tm help. Link it into PATH: ln -s "$PWD/bin/tm" ~/.local/bin/tm
+here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m tm.cli "$@"

@@ -1,0 +1,37 @@
+# The monitor as one container. deploy/deploy.sh puts the code into $TM_DIR/app and runs:
+#   TM_DIR=/srv/tm TM_PUBLIC_HOST=tm.example.org docker compose -p tm -f $TM_DIR/app/deploy/docker-compose.yml up -d --build
+# Secrets are files on the host, never in git: $TM_DIR/tm.env, $TM_DIR/ssh/, $TM_DIR/secrets/ (README).
+#
+# This file assumes a reverse proxy in the style of nginx-proxy + acme-companion on an external
+# docker network "proxy" (VIRTUAL_HOST / LETSENCRYPT_HOST). With another proxy, drop those
+# variables and the network, and publish the port instead, e.g. ports: ["127.0.0.1:8080:8080"].
+name: tm
+services:
+  monitor:
+    build: ..
+    image: tm-monitor:latest
+    container_name: tm-monitor
+    restart: unless-stopped
+    env_file: ${TM_DIR:-/srv/tm}/tm.env
+    environment:
+      VIRTUAL_HOST: ${TM_PUBLIC_HOST:?set TM_PUBLIC_HOST}
+      VIRTUAL_PORT: "8080"
+      LETSENCRYPT_HOST: ${TM_PUBLIC_HOST:?set TM_PUBLIC_HOST}
+      TM_SSH_KEY: /ssh/id_ed25519
+      TM_SSH_KNOWN_HOSTS: /ssh/known_hosts
+      TM_TELEGRAM_TOKEN_FILE: /secrets/telegram_bot_token   # optional: Telegram sign-in
+      TM_GITHUB_TOKEN_FILE: /secrets/github_token           # optional: private git_repos for MCP submit_job
+    volumes:
+      - ${TM_DIR:-/srv/tm}/tm.toml:/app/tm.toml:ro
+      - ${TM_DIR:-/srv/tm}/data:/data
+      - ${TM_DIR:-/srv/tm}/ssh:/ssh:ro
+      - ${TM_DIR:-/srv/tm}/secrets:/secrets:ro
+    mem_limit: 256m
+    cpus: 0.5
+    networks: [proxy]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+networks:
+  proxy:
+    external: true

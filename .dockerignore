@@ -1,0 +1,8 @@
+.git
+.claude
+data
+tests
+deploy
+tm.toml
+*.env
+**/__pycache__

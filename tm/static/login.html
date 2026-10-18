@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tm — sign in</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login">
+<main class="login-box">
+  <h1>tm</h1>
+  <p class="muted">Compute jobs</p>
+  <p class="error">{{error}}</p>
+  <div class="tg">{{telegram}}</div>
+  <form method="post" action="/login">
+    <label>User <input name="user" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+</body>
+</html>

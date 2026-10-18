@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tm — jobs</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <h1>tm</h1>
+  <span id="updated" class="muted"></span>
+  <form method="post" action="/logout" class="logout"><button type="submit" class="link">sign out</button></form>
+</header>
+<section id="runners" class="runners"></section>
+<section class="filters">
+  <select id="f-runner" aria-label="Runner"><option value="">all runners</option></select>
+  <div id="f-state" class="chips" role="group" aria-label="State"></div>
+  <input id="f-text" type="search" placeholder="search by name or command">
+</section>
+<section>
+  <table id="jobs" class="jobs">
+    <thead><tr><th>Job</th><th>State</th><th>Progress</th><th>Time</th><th>Cores</th><th>Runner</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p id="empty" class="muted" hidden>No jobs.</p>
+</section>
+<div id="detail" class="detail" hidden>
+  <div class="detail-box" role="dialog" aria-modal="true">
+    <div class="detail-head">
+      <h2 id="d-title"></h2>
+      <button id="d-close" class="link" aria-label="Close">✕</button>
+    </div>
+    <div id="d-body"></div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# tm monitor configuration. Copy to tm.toml (git-ignored) and edit.
+# No secrets here: those come from the environment (see README, "Configuration").
+
+# One entry per runner.
+#   ssh   user@host the monitor connects to (the key is restricted to tm-agent, see README)
+#   cpus  the cores tm may hand out there, e.g. "0-15" or "2-7,12"
+#   mem   the memory tm may hand out there
+#   jobs  kind -> job root on the runner. The kind "tm" holds tm's own jobs; any other kind is a
+#         directory of jobs started by your own scripts in the same layout, which tm shows too.
+#         The same map goes to the runner's /etc/tm-agent.json (deploy/install-agent.py).
+#   user  the unprivileged account jobs run as (default "tm")
+#   port  ssh port (default 22); disabled = true takes a runner out of scheduling
+runners = [
+  { name = "runner1", ssh = "root@runner.example.org", cpus = "0-7", mem = "16G", user = "tm", jobs = { tm = "/srv/tm-jobs/tm", batch = "/srv/tm-jobs/batch" } },
+  # { name = "runner2", ssh = "root@runner2.example.org", port = 2222, cpus = "0-31", mem = "120G", jobs = { tm = "/srv/tm-jobs/tm" } },
+]
+
+# Telegram sign-in (optional): the bot's username and the numeric user ids allowed in
+# (ids, not usernames: a username can change). The bot token is a secret: TM_TELEGRAM_TOKEN_FILE.
+allowed_telegram_ids = []
+telegram_bot = ""
+
+# MCP submit_job fetches a job's tree from GitHub by commit, and only from these repositories.
+# A private one also needs a read-only token in TM_GITHUB_TOKEN_FILE.
+git_repos = ["github.com/example-org/example-project"]
+
+poll_seconds = 4
+lost_after_seconds = 90
+# Failed and lost jobs nobody has touched for this long are removed: their directory on the runner
+# (tm-agent purge) or their row in the queue. Checked hourly; 0 turns the cleanup off.
+purge_after_seconds = 172800
+default_nice = 15

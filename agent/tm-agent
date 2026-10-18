@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""tm-agent: what the monitor may do on a runner, and nothing else.
+
+Installed as /usr/local/bin/tm-agent and called as the forced command of the monitor's ssh key
+(authorized_keys: command="/usr/local/bin/tm-agent",restrict ...). The command the client asked
+for arrives in SSH_ORIGINAL_COMMAND and is parsed here; there is no shell behind it.
+
+    snapshot                          host load and every job of every kind, as JSON
+    show KIND ID [LINES]              one job: meta, unit, log tail, out/ listing
+    log KIND ID [LINES]               the tail of the job's log
+    fetch KIND ID                     tar.gz of out/ log meta exit, to stdout
+    cancel KIND ID                    systemctl stop KIND-ID, exit file "cancelled"
+    purge KIND ID MIN_AGE             remove a failed or lost job's directory, untouched MIN_AGE seconds
+    start ID OPTIONS                  a new tm job; the tree as tar.gz on stdin, or --from KIND/ID
+
+A job is a directory <root>/<ID>/{tree,out,log,meta,cmd.sh,run.sh,exit} and a systemd unit
+<kind>-<ID>. tm's own jobs live under the kind "submit_kind" (default "tm"); other kinds are job
+directories in the same layout made by your own scripts, which tm shows and can cancel or purge.
+The kinds and their roots come from /etc/tm-agent.json, never from the caller:
+
+    {"user": "tm", "submit_kind": "tm", "kinds": {"tm": "/srv/tm-jobs/tm", "batch": "/srv/tm-jobs/batch"}}
+"""
+import base64
+import glob
+import io
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+from datetime import datetime
+
+CONF_PATH = os.environ.get("TM_AGENT_CONF", "/etc/tm-agent.json")
+ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
+CPUS_RE = re.compile(r"^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$")
+MEM_RE = re.compile(r"^[0-9]+[KMGT]?$")
+META_KEY_RE = re.compile(r"^([a-z_]+)=(.*)$")
+# purge: never younger than this whatever the monitor asks, and never these names in a kind's
+# root (shared caches and run records may live next to the jobs: <root>/cache, <root>/runs).
+PURGE_MIN_AGE = 86400
+PURGE_KEEP = ("cache", "runs")
+
+
+def fail(msg, code=2):
+    sys.stderr.write("tm-agent: %s\n" % msg)
+    sys.exit(code)
+
+
+def load_conf():
+    try:
+        with open(CONF_PATH) as f:
+            conf = json.load(f)
+    except OSError as e:
+        fail("no config %s: %s" % (CONF_PATH, e))
+    conf.setdefault("user", "tm")
+    conf.setdefault("submit_kind", "tm")
+    return conf
+
+
+def kind_root(conf, kind):
+    root = conf["kinds"].get(kind)
+    if not root:
+        fail("unknown kind %r" % kind)
+    return root
+
+
+def job_dir(conf, kind, jid):
+    if not ID_RE.match(jid) or jid in (".", ".."):
+        fail("bad job id %r" % jid)
+    return os.path.join(kind_root(conf, kind), jid)
+
+
+def read(path, limit=None):
+    try:
+        with open(path, "rb") as f:
+            data = f.read() if limit is None else f.read(limit)
+        return data.decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def tail(path, lines=40, max_bytes=256 * 1024):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+    except OSError:
+        return None
+    text = data.decode("utf-8", "replace").splitlines()
+    return "\n".join(text[-lines:]) if lines > 0 else ""
+
+
+def parse_meta(text):
+    """key=value lines; everything after cmd= is the command (it may span lines)."""
+    meta = {}
+    if not text:
+        return meta
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = META_KEY_RE.match(line)
+        if not m:
+            continue
+        key, value = m.group(1), m.group(2)
+        if key == "cmd":
+            meta["cmd"] = "\n".join([value] + lines[i + 1:])
+            break
+        meta[key] = value
+    return meta
+
+
+def progress(jdir, meta):
+    p = read(os.path.join(jdir, "progress"), 200)
+    if p:
+        m = re.match(r"\s*(\d+)\s*/\s*(\d+)", p)
+        if m:
+            return {"done": int(m.group(1)), "total": int(m.group(2)), "from": "progress"}
+    pattern = meta.get("progress_glob")
+    if pattern and ".." not in pattern and not pattern.startswith("/"):
+        n = len(glob.glob(os.path.join(jdir, pattern)))
+        total = meta.get("progress_total")
+        return {"done": n, "total": int(total) if total and total.isdigit() else None, "from": "glob"}
+    return None
+
+
+def iso_mtime(path):
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(os.stat(path).st_mtime))
+    except OSError:
+        return None
+
+
+def started_at(jdir):
+    head = read(os.path.join(jdir, "log"), 300) or ""
+    m = re.search(r"^started (\S+)", head, re.M)
+    return m.group(1) if m else None
+
+
+def units(conf):
+    """Loaded units of our kinds: name -> props (only loaded units exist; a finished one is gone)."""
+    patterns = ["%s-*" % k for k in conf["kinds"]]
+    out = subprocess.run(["systemctl", "list-units", "--all", "--plain", "--no-legend", "--type=service"] + patterns,
+                         capture_output=True, text=True).stdout
+    names = [line.split()[0] for line in out.splitlines() if line.strip()]
+    props = {}
+    if names:
+        out = subprocess.run(["systemctl", "show", "-p", "Id,ActiveState,SubState,CPUUsageNSec,MemoryCurrent,ActiveEnterTimestampMonotonic,ActiveEnterTimestamp"] + names,
+                             capture_output=True, text=True).stdout
+        for block in out.split("\n\n"):
+            d = dict(line.split("=", 1) for line in block.splitlines() if "=" in line)
+            if d.get("Id"):
+                props[d["Id"][:-len(".service")] if d["Id"].endswith(".service") else d["Id"]] = d
+    return props
+
+
+def job_summary(conf, kind, jid, unit_props, with_tail):
+    jdir = os.path.join(kind_root(conf, kind), jid)
+    meta = parse_meta(read(os.path.join(jdir, "meta"), 64 * 1024))
+    cmd = meta.get("cmd", "")
+    if len(cmd) > 4000:
+        meta["cmd"] = cmd[:4000] + " …"
+    exit_text = read(os.path.join(jdir, "exit"), 100)
+    u = unit_props.get("%s-%s" % (kind, jid))
+    try:
+        log_stat = os.stat(os.path.join(jdir, "log"))
+        log_size, log_mtime = log_stat.st_size, int(log_stat.st_mtime)
+    except OSError:
+        log_size, log_mtime = 0, None
+    active = bool(u and u.get("ActiveState") in ("active", "activating", "reloading"))
+    j = {
+        "kind": kind,
+        "id": jid,
+        "meta": meta,
+        "exit": exit_text.strip() if exit_text is not None else None,
+        "unit": u.get("ActiveState") if u else "gone",
+        "cpu_ns": int(u["CPUUsageNSec"]) if u and u.get("CPUUsageNSec", "").isdigit() else None,
+        "mem_bytes": int(u["MemoryCurrent"]) if u and u.get("MemoryCurrent", "").isdigit() else None,
+        "started": started_at(jdir),
+        "finished": iso_mtime(os.path.join(jdir, "exit")) if exit_text is not None else None,
+        "log_size": log_size,
+        "log_mtime": log_mtime,
+        "progress": progress(jdir, meta),
+    }
+    if with_tail or active:
+        j["tail"] = tail(os.path.join(jdir, "log"), 3)
+    return j
+
+
+def host_info():
+    info = {"hostname": os.uname().nodename, "ncpu": os.cpu_count(), "time": time.time()}
+    try:
+        info["load"] = [float(x) for x in open("/proc/loadavg").read().split()[:3]]
+    except OSError:
+        pass
+    mem = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, v = line.split(":", 1)
+            if k in ("MemTotal", "MemAvailable"):
+                mem[k] = int(v.split()[0]) * 1024
+    except OSError:
+        pass
+    info["mem_total"], info["mem_available"] = mem.get("MemTotal"), mem.get("MemAvailable")
+    cpus = {}
+    try:
+        for line in open("/proc/stat"):
+            if re.match(r"^cpu\d+ ", line):
+                parts = line.split()
+                vals = [int(x) for x in parts[1:]]
+                idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+                cpus[int(parts[0][3:])] = [sum(vals), idle]
+    except OSError:
+        pass
+    info["cpu_ticks"] = cpus
+    return info
+
+
+def cmd_snapshot(conf, args):
+    props = units(conf)
+    jobs = []
+    for kind, root in sorted(conf["kinds"].items()):
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if ID_RE.match(name) and os.path.isfile(os.path.join(root, name, "meta")):
+                jobs.append(job_summary(conf, kind, name, props, False))
+    json.dump({"host": host_info(), "kinds": conf["kinds"], "jobs": jobs}, sys.stdout)
+
+
+def cmd_show(conf, args):
+    if len(args) < 2:
+        fail("show KIND ID [LINES]")
+    kind, jid = args[0], args[1]
+    lines = min(int(args[2]), 5000) if len(args) > 2 and args[2].isdigit() else 200
+    jdir = job_dir(conf, kind, jid)
+    if not os.path.isfile(os.path.join(jdir, "meta")):
+        fail("no job %s/%s" % (kind, jid), 1)
+    j = job_summary(conf, kind, jid, units(conf), True)
+    j["tail"] = tail(os.path.join(jdir, "log"), lines)
+    meta_text = read(os.path.join(jdir, "meta"), 64 * 1024)
+    j["meta"]["cmd"] = parse_meta(meta_text).get("cmd") or read(os.path.join(jdir, "cmd.sh"), 64 * 1024)
+    out = []
+    odir = os.path.join(jdir, "out")
+    for dirpath, dirnames, filenames in os.walk(odir):
+        for fn in sorted(filenames):
+            p = os.path.join(dirpath, fn)
+            try:
+                out.append([os.path.relpath(p, odir), os.path.getsize(p)])
+            except OSError:
+                pass
+            if len(out) >= 300:
+                break
+        if len(out) >= 300:
+            break
+    j["out"] = out
+    json.dump(j, sys.stdout)
+
+
+def cmd_log(conf, args):
+    if len(args) < 2:
+        fail("log KIND ID [LINES]")
+    lines = min(int(args[2]), 20000) if len(args) > 2 and args[2].isdigit() else 40
+    t = tail(os.path.join(job_dir(conf, args[0], args[1]), "log"), lines, 8 * 1024 * 1024)
+    if t is None:
+        fail("no log", 1)
+    sys.stdout.write(t + "\n")
+
+
+def cmd_fetch(conf, args):
+    if len(args) < 2:
+        fail("fetch KIND ID")
+    jdir = job_dir(conf, args[0], args[1])
+    if not os.path.isdir(jdir):
+        fail("no job", 1)
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tar:
+        for name in ("out", "log", "meta", "exit", "progress"):
+            p = os.path.join(jdir, name)
+            if os.path.exists(p):
+                tar.add(p, arcname=name)
+
+
+def cmd_cancel(conf, args):
+    if len(args) < 2:
+        fail("cancel KIND ID")
+    kind, jid = args[0], args[1]
+    jdir = job_dir(conf, kind, jid)
+    if not os.path.isfile(os.path.join(jdir, "meta")):
+        fail("no job %s/%s" % (kind, jid), 1)
+    subprocess.run(["systemctl", "stop", "%s-%s" % (kind, jid)], capture_output=True)
+    ex = os.path.join(jdir, "exit")
+    if not os.path.exists(ex):
+        with open(ex, "w") as f:
+            f.write("cancelled\n")
+        shutil.chown(ex, conf["user"], conf["user"])
+    sys.stdout.write((read(ex) or "").strip() + "\n")
+
+
+def unit_active_state(kind, jid):
+    """ActiveState of the job's unit ("inactive" when there is none), or None if systemctl cannot tell."""
+    r = subprocess.run(["systemctl", "show", "-p", "ActiveState", "--value", "%s-%s.service" % (kind, jid)],
+                       capture_output=True, text=True)
+    state = r.stdout.strip()
+    return state if r.returncode == 0 and state else None
+
+
+def mtime(path):
+    try:
+        return os.lstat(path).st_mtime
+    except OSError:
+        return None
+
+
+def last_update(jdir, meta):
+    """The latest of everything that says the job was touched: exit, log, dir, out/, started, submitted."""
+    times = [mtime(os.path.join(jdir, n)) for n in ("exit", "log", "out", "progress")] + [mtime(jdir)]
+    for s in (started_at(jdir), meta.get("submitted")):
+        if s:
+            try:
+                times.append(datetime.fromisoformat(s).timestamp())
+            except ValueError:
+                pass
+    times = [t for t in times if t is not None]
+    return max(times) if times else None
+
+
+def cmd_purge(conf, args):
+    """Remove one job's directory, and only a failed or lost one nobody has touched for MIN_AGE.
+
+    Refused: an unknown kind, a bad id or one of the shared names, anything that is not a plain
+    directory right under the kind's root (a symlink is refused, not followed), a directory without
+    meta, a job whose unit is loaded and not dead, an exit file that says done or cancelled, and a
+    job touched less than max(MIN_AGE, PURGE_MIN_AGE) seconds ago."""
+    if len(args) < 3 or not args[2].isdigit():
+        fail("purge KIND ID MIN_AGE_SECONDS")
+    kind, jid, min_age = args[0], args[1], max(int(args[2]), PURGE_MIN_AGE)
+    jdir = job_dir(conf, kind, jid)
+    if jid in PURGE_KEEP or jid.startswith("."):
+        fail("refused: %s is not a job" % jid)
+    root = os.path.realpath(kind_root(conf, kind))
+    try:
+        st = os.lstat(jdir)
+    except OSError:
+        fail("no job %s/%s" % (kind, jid), 1)
+    if not stat.S_ISDIR(st.st_mode) or os.path.realpath(jdir) != os.path.join(root, jid):
+        fail("refused: %s/%s is not a directory under %s" % (kind, jid, root))
+    meta_path = os.path.join(jdir, "meta")
+    if os.path.islink(meta_path) or not os.path.isfile(meta_path):
+        fail("refused: %s/%s has no meta" % (kind, jid))
+    unit = unit_active_state(kind, jid)
+    if unit is None:
+        fail("refused: systemctl cannot tell the state of %s-%s" % (kind, jid))
+    if unit not in ("inactive", "failed"):
+        fail("refused: unit %s-%s is %s" % (kind, jid, unit))
+    if os.path.islink(os.path.join(jdir, "exit")):
+        fail("refused: exit is a symlink")
+    ex = read(os.path.join(jdir, "exit"), 100)
+    ex = ex.strip() if ex is not None else None
+    if ex is None:
+        state = "lost"
+    elif ex == "0":
+        fail("refused: %s/%s is done" % (kind, jid))
+    elif ex == "cancelled":
+        fail("refused: %s/%s is cancelled" % (kind, jid))
+    else:
+        state = "failed"
+    last = last_update(jdir, parse_meta(read(meta_path, 64 * 1024)))
+    if last is None:
+        fail("refused: no time to judge %s/%s by" % (kind, jid))
+    age = time.time() - last
+    if age < min_age:
+        fail("refused: %s/%s was touched %ds ago, less than %ds" % (kind, jid, age, min_age))
+    shutil.rmtree(jdir)  # does not follow symlinks inside: a link to elsewhere is removed, not its target
+    sys.stdout.write(json.dumps({"purged": "%s/%s" % (kind, jid), "state": state, "exit": ex, "age": int(age)}) + "\n")
+
+
+RUN_SH = r'''cd "$JOB_ROOT/tree"
+echo "started $(date -Is) on $(hostname), cpus $(cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cpuset.cpus.effective 2>/dev/null)"
+bash "$JOB_ROOT/cmd.sh"
+rc=$?
+echo "finished $(date -Is), exit $rc"
+[ -f "$JOB_ROOT/exit" ] || echo $rc > "$JOB_ROOT/exit"
+exit $rc
+'''
+
+
+def cmd_start(conf, args):
+    if not args:
+        fail("start ID --cpus C --mem M --cmd B64 [--meta B64JSON] [--nice N] [--cache KIND] [--from KIND/ID]")
+    jid, opts = args[0], {}
+    rest = args[1:]
+    while rest:
+        if len(rest) < 2 or not rest[0].startswith("--"):
+            fail("bad options")
+        opts[rest[0][2:]] = rest[1]
+        rest = rest[2:]
+    kind = conf["submit_kind"]
+    root = kind_root(conf, kind)
+    jdir = job_dir(conf, kind, jid)
+    cpus, mem = opts.get("cpus", ""), opts.get("mem", "")
+    nice = opts.get("nice", "15")
+    if not CPUS_RE.match(cpus):
+        fail("bad --cpus")
+    if not MEM_RE.match(mem):
+        fail("bad --mem")
+    if not re.match(r"^-?\d+$", nice) or not 0 <= int(nice) <= 19:
+        fail("bad --nice")
+    cache_kind = opts.get("cache", kind)
+    cache = os.path.join(conf["kinds"][cache_kind] if cache_kind in conf["kinds"] else root, "cache")
+    try:
+        cmd = base64.b64decode(opts["cmd"]).decode()
+        extra = json.loads(base64.b64decode(opts.get("meta", "e30=")).decode())
+    except Exception:
+        fail("bad --cmd or --meta")
+    if os.path.exists(jdir):
+        fail("job %s exists" % jid, 1)
+    os.makedirs(os.path.join(jdir, "out"))
+    os.makedirs(cache, exist_ok=True)
+    tree = os.path.join(jdir, "tree")
+    if "from" in opts:
+        src_kind, _, src_id = opts["from"].partition("/")
+        src = os.path.join(job_dir(conf, src_kind, src_id), "tree")
+        if not os.path.isdir(src):
+            shutil.rmtree(jdir)
+            fail("no tree in %s" % opts["from"], 1)
+        shutil.copytree(src, tree, symlinks=True)
+    else:
+        os.makedirs(tree)
+        data = sys.stdin.buffer.read()
+        if data:  # no data: the job runs in an empty tree/
+            try:
+                with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+                    tar.extractall(tree, filter="data")
+            except (tarfile.TarError, OSError) as e:
+                shutil.rmtree(jdir)  # the directory made a moment ago, nothing else
+                fail("bad tree archive: %s" % e, 1)
+    with open(os.path.join(jdir, "cmd.sh"), "w") as f:
+        f.write(cmd)
+    meta = [("id", jid)]
+    for k in ("sha", "tree", "name", "repo", "runner", "prio", "by", "cores", "retry_of", "progress_glob", "progress_total"):
+        if extra.get(k) not in (None, ""):
+            meta.append((k, re.sub(r"[\r\n]", " ", str(extra[k]))))
+    meta += [("submitted", extra.get("submitted") or time.strftime("%Y-%m-%dT%H:%M:%S%z")),
+             ("started_by", "tm"), ("cpus", cpus), ("mem", mem), ("cmd", cmd)]
+    with open(os.path.join(jdir, "meta"), "w") as f:
+        f.write("".join("%s=%s\n" % kv for kv in meta))
+    with open(os.path.join(jdir, "run.sh"), "w") as f:
+        f.write(RUN_SH)
+    user = conf["user"]
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        shutil.rmtree(jdir)
+        fail("no user %r on this runner" % user, 1)
+    subprocess.run(["chown", "-R", "%s:%s" % (user, user), jdir], check=True)
+    subprocess.run(["chown", "%s:%s" % (user, user), cache], check=True)
+    r = subprocess.run([
+        "systemd-run", "--quiet", "--unit=%s-%s" % (kind, jid), "--uid=" + user, "--gid=" + user,
+        "-p", "AllowedCPUs=" + cpus, "-p", "MemoryMax=" + mem, "-p", "Nice=" + nice,
+        "-p", "IOSchedulingClass=idle",
+        "-p", "StandardOutput=append:%s/log" % jdir, "-p", "StandardError=append:%s/log" % jdir,
+        "--setenv=JOB_ROOT=" + jdir, "--setenv=JOB_OUT=%s/out" % jdir, "--setenv=JOB_CACHE=" + cache,
+        "--setenv=HOME=" + home, "--setenv=PATH=%s/bin:/usr/local/bin:/usr/bin:/bin" % cache,
+        "bash", os.path.join(jdir, "run.sh")], capture_output=True, text=True)
+    if r.returncode != 0:
+        with open(os.path.join(jdir, "exit"), "w") as f:
+            f.write("dispatch failed\n")
+        fail("systemd-run failed: %s" % r.stderr.strip(), 1)
+    sys.stdout.write(json.dumps({"started": jid, "kind": kind, "dir": jdir}) + "\n")
+
+
+COMMANDS = {"snapshot": cmd_snapshot, "show": cmd_show, "log": cmd_log, "fetch": cmd_fetch,
+            "cancel": cmd_cancel, "purge": cmd_purge, "start": cmd_start}
+
+
+def main():
+    line = os.environ.get("SSH_ORIGINAL_COMMAND")
+    argv = shlex.split(line) if line is not None else sys.argv[1:]
+    if argv and os.path.basename(argv[0]) == "tm-agent":
+        argv = argv[1:]
+    if not argv or argv[0] not in COMMANDS:
+        fail("commands: " + ", ".join(sorted(COMMANDS)))
+    COMMANDS[argv[0]](load_conf(), argv[1:])
+
+
+if __name__ == "__main__":
+    main()

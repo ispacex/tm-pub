@@ -1,0 +1,8 @@
+.claude/
+__pycache__/
+*.pyc
+/data/
+/remote-results/
+# local configuration and secrets: tm.example.toml is the template
+/tm.toml
+*.env
